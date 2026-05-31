@@ -27,9 +27,11 @@ CACHE_TTL = 3600          # seconds to keep a successful PyPI response
 NEG_TTL = 60              # seconds to keep a failure/404 (negative cache)
 CACHE_PATH = Path(os.environ.get("PYSIZE_CACHE") or Path(__file__).with_name("pysize-cache.sqlite"))
 MAX_CONCURRENCY = 12      # simultaneous outbound requests to PyPI
+MAX_PACKAGES = 800        # stop expanding past this many unique packages (abuse guard)
+RESOLVE_TIMEOUT = 45      # seconds; bounded below nginx's proxy_read_timeout
 MEM_BUDGET = 32 * 1024 * 1024  # bytes of cached JSON text kept in memory
 PURGE_INTERVAL = 600      # seconds between expired-row sweeps
-USER_AGENT = "pysize-poc (+https://github.com/; package-size explorer)"
+USER_AGENT = "pysize/1.0 (+https://github.com/svandragt/pysize; https://pysize.vandragt.com)"
 
 # Evaluate environment markers against a fixed target Python, not whatever
 # interpreter happens to run the server — otherwise results drift (e.g. a
@@ -277,7 +279,8 @@ async def resolve(
     is re-expanded only when its chosen version or its extra set changes — so
     self-references like `pkg[all]` -> `pkg[eval]` union cleanly and terminate.
 
-    Returns canonical name -> {name, version, size}.
+    Returns (info, truncated): canonical name -> {name, version, size}, and
+    whether expansion stopped early at MAX_PACKAGES.
     """
     root_canon = canonicalize_name(root.name)
     name_for = {root_canon: root.name}
@@ -285,11 +288,16 @@ async def resolve(
     node_extras: dict[str, set[str]] = {}
     processed: dict[str, tuple] = {}        # canon -> (version, frozenset(extras)) last expanded
     info: dict[str, dict] = {}              # canon -> {name, version, size}
+    truncated = False
     pending: dict[str, tuple[SpecifierSet, set[str]]] = {
         root_canon: (root.specifier, set(root.extras))
     }
 
     while pending:
+        # Abuse guard: stop growing the graph past a sane ceiling.
+        if len(node_spec) > MAX_PACKAGES:
+            truncated = True
+            break
         # Merge incoming constraints into each node's accumulated state.
         nodes = list(pending)
         for canon, (spec, extras) in pending.items():
@@ -337,7 +345,7 @@ async def resolve(
                 spec, extras = pending.get(dep, (SpecifierSet(), set()))
                 pending[dep] = (spec & req.specifier, extras | set(req.extras))
 
-    return info
+    return info, truncated
 
 
 @app.get("/api/size")
@@ -354,7 +362,14 @@ async def api_size(request: Request, pkg: str):
     if cached not in (_MISS, None):
         return cached
 
-    info = await resolve(request.app.state.client, req)
+    try:
+        info, truncated = await asyncio.wait_for(
+            resolve(request.app.state.client, req), timeout=RESOLVE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": f"Resolving '{req.name}' timed out"}, status_code=504
+        )
 
     root = canonicalize_name(req.name)
     root_pkg = info.get(root)
@@ -377,6 +392,7 @@ async def api_size(request: Request, pkg: str):
         "total_size": total,
         "dep_count": len(deps),
         "packages": deps,
+        "truncated": truncated,
     }
     await cache.set(key, result, CACHE_TTL)
     return result

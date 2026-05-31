@@ -11,12 +11,13 @@ sandbox.
 ## Quick start
 
 ```bash
-uv run main.py
+make run        # or: uv run main.py
 # open http://127.0.0.1:8731
 ```
 
 That's it — [uv](https://docs.astral.sh/uv/) reads the dependencies from the
-inline script header in `main.py` and runs the server.
+inline script header in `main.py` and runs the server. Run `make help` for the
+other targets (`verify`, `ping`, `deploy`, `logs`, `clean`).
 
 ## How sizes are measured
 
@@ -74,6 +75,7 @@ uv run verify.py flask boto3 # specific ones
 | `index.html` | Single-page frontend |
 | `verify.py` | Correctness check against `uv` |
 | `ansible/` | Deployment playbook (nginx + systemd) |
+| `Makefile` | Common tasks (`make help`) |
 | `docs/` | Documentation |
 
 ## Status

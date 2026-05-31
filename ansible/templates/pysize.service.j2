@@ -21,9 +21,26 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths={{ state_dir }}
 ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 RestrictSUIDSGID=true
 LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryDenyWriteExecute=true
+
+# Resource ceilings — runaway guard.
+MemoryMax=512M
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target
