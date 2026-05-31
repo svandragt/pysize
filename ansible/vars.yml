@@ -1,7 +1,7 @@
 ---
 # ── Edit these for your server ──────────────────────────────────────────────
 domain: pysize.example.com               # subdomain to serve (DNS A/AAAA must already point here)
-repo_url: https://github.com/youruser/pysize.git
+repo_url: https://github.com/svandragt/pysize.git   # public clone (no server SSH key needed); use git@github.com:svandragt/pysize.git if private
 repo_version: main                       # branch/tag/commit to deploy
 certbot_email: you@example.com           # for Let's Encrypt expiry notices
 
