@@ -33,6 +33,7 @@ NEG_TTL = 60              # seconds to keep a failure/404 (negative cache)
 CACHE_PATH = Path(os.environ.get("PYSIZE_CACHE") or Path(__file__).with_name("pysize-cache.sqlite"))
 MAX_CONCURRENCY = 12      # simultaneous outbound requests to PyPI
 MAX_PACKAGES = 800        # stop expanding past this many unique packages (abuse guard)
+TOP_PACKAGES_COUNT = 24   # heaviest PyPI projects shown as explore-me chips on the home page
 RESOLVE_TIMEOUT = 45      # seconds; bounded below nginx's proxy_read_timeout
 MEM_BUDGET = 32 * 1024 * 1024  # bytes of cached JSON text kept in memory
 PURGE_INTERVAL = 600      # seconds between expired-row sweeps
@@ -189,7 +190,12 @@ async def lifespan(app: FastAPI):
     global cache, sem
     cache = Cache(CACHE_PATH)
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    app.state.client = httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, timeout=20)
+    # PyPI content-negotiates: the /stats/ endpoint returns HTML unless we ask
+    # for JSON. The /pypi/.../json endpoints return JSON regardless, so this
+    # default is safe for every request.
+    app.state.client = httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, timeout=20
+    )
 
     async def purge_loop():
         while True:
@@ -474,6 +480,27 @@ async def api_size(request: Request, pkg: str):
     }
     await cache.set(key, result, CACHE_TTL)
     return result
+
+
+@app.get("/api/top")
+async def api_top(request: Request):
+    """Seed the home page with the heaviest projects on PyPI.
+
+    Sourced from PyPI's own /stats/ endpoint (top ~100 projects by total upload
+    footprint). We expose only the *names* — pysize's job is to show each one's
+    install size and dependency count once clicked, not to restate PyPI's
+    storage numbers. `total_size` is PyPI's all-of-PyPI figure, used purely as a
+    scale-setting fact on the landing page.
+    """
+    data = await get_json(request.app.state.client, "https://pypi.org/stats/")
+    if not data:
+        return JSONResponse({"error": "PyPI stats unavailable"}, status_code=502)
+    top = data.get("top_packages") or {}
+    names = sorted(top, key=lambda n: top[n].get("size") or 0, reverse=True)
+    return {
+        "total_size": data.get("total_packages_size") or 0,
+        "packages": names[:TOP_PACKAGES_COUNT],
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
