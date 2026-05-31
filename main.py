@@ -21,6 +21,16 @@ app = FastAPI()
 
 CACHE_TTL = 3600  # seconds to keep a PyPI response
 
+# Evaluate environment markers against a fixed target Python, not whatever
+# interpreter happens to run the server — otherwise results drift (e.g. a
+# `python_version < "3.13"` dep appears or vanishes based on the host).
+TARGET_PYTHON = "3.12"
+_TARGET_ENV = {
+    **default_environment(),
+    "python_version": TARGET_PYTHON,
+    "python_full_version": TARGET_PYTHON + ".0",
+}
+
 # Shared across requests: URL -> (expiry_monotonic, parsed_json_or_None).
 _cache: dict[str, tuple[float, dict | None]] = {}
 # In-flight de-duplication: URL -> Future, so concurrent callers share one fetch.
@@ -110,12 +120,11 @@ def marker_allows(req: Requirement, extras: set[str]) -> bool:
     """
     if req.marker is None:
         return True
-    env = default_environment()
     # Evaluate against each requested extra plus the base (no-extra) case;
     # include if any matches. Markers that don't reference `extra` evaluate
     # the same regardless, so the base case covers ordinary platform markers.
     for e in {""} | set(extras):
-        if req.marker.evaluate({**env, "extra": e}):
+        if req.marker.evaluate({**_TARGET_ENV, "extra": e}):
             return True
     return False
 
