@@ -53,13 +53,25 @@ interpreter — otherwise `python_version`-gated deps appear/vanish based on wha
 server. Change `TARGET_PYTHON` to resolve for a different Python; `verify.py` must use the
 same target to compare fairly.
 
-**Caching (`Cache` class)** — two tiers, both 1h TTL: a size-bounded in-memory LRU
-(32 MB of JSON text) over a SQLite file (`PYSIZE_CACHE` env, defaults next to `main.py`;
-gitignored). SQLite bounds RAM (a single botocore index is ~3 MB JSON) and survives
-restarts. *Both* PyPI responses and full resolution results are cached (resolution keyed
+**Caching (`Cache` class)** — two tiers: a size-bounded in-memory LRU (32 MB of JSON
+text) over a SQLite file (`PYSIZE_CACHE` env, defaults next to `main.py`; gitignored).
+SQLite bounds RAM (a single botocore index is ~3 MB JSON) and survives restarts. *Both*
+PyPI responses and full resolution results are cached (resolution keyed
 `resolve:name[extras]specifier`). SQLite I/O runs via `asyncio.to_thread`. A shared
 `httpx.AsyncClient` (lifespan-managed) plus a concurrency semaphore (`MAX_CONCURRENCY`)
 keep PyPI traffic polite; single-flight de-dup shares concurrent identical fetches.
+
+Each entry stores two timestamps — `fresh` and `expires` — so PyPI fetches are
+**stale-while-revalidate**: past `fresh` the cached value is served immediately and a
+background revalidation (single-flighted, tracked in `_background_tasks`, cancelled on
+shutdown) refreshes it. Windows differ by mutability: the package *index*
+(`/pypi/{name}/json`, new releases/yanks appear here) stays fresh 1h / stale 1d
+(`CACHE_TTL`/`STALE_TTL`); *per-version* metadata (`/pypi/{name}/{version}/json`) is
+immutable once published, so it's fresh 7d / stale 30d (`VERSION_TTL`/`VERSION_STALE_TTL`).
+Failures get a brief 60s negative cache with no stale window. The resolution-result cache
+has no stale window (`fresh == expires`), so it's plain 1h expiry as before. `get_swr()`
+returns `(value, is_stale)`; `get()` is fresh-only (stale ⇒ miss). An old single-`expires`
+DB is migrated in place (`fresh` backfilled to `expires`).
 
 Abuse guards: `MAX_PACKAGES` caps graph size (sets a `truncated` flag), `RESOLVE_TIMEOUT`
 bounds the whole request.
