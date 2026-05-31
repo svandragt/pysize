@@ -23,7 +23,12 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-CACHE_TTL = 3600          # seconds to keep a successful PyPI response
+CACHE_TTL = 3600          # seconds a successful PyPI response stays fresh
+STALE_TTL = 86400         # extra seconds a stale PyPI response is served while it revalidates
+# A published version's metadata is immutable (only a rare yank flag can flip),
+# so the per-version endpoint stays fresh for a week and serves stale for a month.
+VERSION_TTL = 7 * 86400
+VERSION_STALE_TTL = 30 * 86400
 NEG_TTL = 60              # seconds to keep a failure/404 (negative cache)
 CACHE_PATH = Path(os.environ.get("PYSIZE_CACHE") or Path(__file__).with_name("pysize-cache.sqlite"))
 MAX_CONCURRENCY = 12      # simultaneous outbound requests to PyPI
@@ -49,11 +54,18 @@ _MISS = object()  # distinguishes "absent/expired" from a cached None
 class Cache:
     """Two-tier TTL cache: a size-bounded in-memory LRU over a SQLite file.
 
+    Each entry carries two timestamps: `fresh` (when the value stops being
+    fresh) and `expires` (the hard-delete point). Between the two an entry is
+    *stale* — still returned, but flagged so callers can revalidate in the
+    background (stale-while-revalidate). Entries with no stale window have
+    `fresh == expires`, so they simply disappear at expiry as before.
+
     Values must be JSON-serializable. A stored value may be None (negative
-    cache); get() returns the _MISS sentinel only when a key is absent or
-    expired. SQLite work runs in a worker thread so it never blocks the loop.
-    Memory is bounded by serialized-text bytes, so a few thousand huge package
-    indexes can be cached on disk without ever holding them all in RAM.
+    cache). get() returns the freshest usable value or the _MISS sentinel when
+    a key is absent or hard-expired; get_swr() additionally reports staleness.
+    SQLite work runs in a worker thread so it never blocks the loop. Memory is
+    bounded by serialized-text bytes, so a few thousand huge package indexes
+    can be cached on disk without ever holding them all in RAM.
     """
 
     def __init__(self, path: Path, mem_budget: int = MEM_BUDGET):
@@ -61,54 +73,61 @@ class Cache:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS cache "
-            "(key TEXT PRIMARY KEY, body TEXT, expires REAL)"
+            "(key TEXT PRIMARY KEY, body TEXT, fresh REAL, expires REAL)"
         )
+        # Migrate pre-SWR databases: add `fresh` and treat old rows as having
+        # no stale window (fresh == their existing expiry).
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(cache)")}
+        if "fresh" not in cols:
+            self._db.execute("ALTER TABLE cache ADD COLUMN fresh REAL")
+            self._db.execute("UPDATE cache SET fresh = expires WHERE fresh IS NULL")
         self._db.commit()
         self._lock = threading.Lock()
-        self._mem: OrderedDict[str, tuple[float, object, int]] = OrderedDict()
+        self._mem: OrderedDict[str, tuple[float, float, object, int]] = OrderedDict()
         self._mem_bytes = 0
         self._mem_budget = mem_budget
 
     # --- in-memory tier (touched only from the event-loop thread) ---
     def _mem_get(self, key: str, now: float):
+        """Return (val, is_stale) for a live entry, or _MISS if absent/expired."""
         hit = self._mem.get(key)
         if hit is None:
             return _MISS
-        exp, val, _ = hit
+        fresh, exp, val, _ = hit
         if exp <= now:
             self._mem_drop(key)
             return _MISS
         self._mem.move_to_end(key)
-        return val
+        return val, fresh <= now
 
     def _mem_drop(self, key: str):
         old = self._mem.pop(key, None)
         if old:
-            self._mem_bytes -= old[2]
+            self._mem_bytes -= old[3]
 
-    def _mem_put(self, key: str, exp: float, val: object, nbytes: int):
+    def _mem_put(self, key: str, fresh: float, exp: float, val: object, nbytes: int):
         self._mem_drop(key)
-        self._mem[key] = (exp, val, nbytes)
+        self._mem[key] = (fresh, exp, val, nbytes)
         self._mem_bytes += nbytes
         while self._mem_bytes > self._mem_budget and self._mem:
-            k, (_, _, nb) = self._mem.popitem(last=False)
-            self._mem_bytes -= nb
+            k, item = self._mem.popitem(last=False)
+            self._mem_bytes -= item[3]
 
     # --- sqlite tier (run via asyncio.to_thread) ---
     def _db_get(self, key: str, now: float):
         with self._lock:
             row = self._db.execute(
-                "SELECT body, expires FROM cache WHERE key=?", (key,)
+                "SELECT body, fresh, expires FROM cache WHERE key=?", (key,)
             ).fetchone()
-        if row is None or row[1] <= now:
+        if row is None or row[2] <= now:
             return _MISS
-        return row[0], row[1]
+        return row[0], row[1], row[2]
 
-    def _db_put(self, key: str, body: str, exp: float):
+    def _db_put(self, key: str, body: str, fresh: float, exp: float):
         with self._lock:
             self._db.execute(
-                "INSERT OR REPLACE INTO cache (key, body, expires) VALUES (?,?,?)",
-                (key, body, exp),
+                "INSERT OR REPLACE INTO cache (key, body, fresh, expires) VALUES (?,?,?,?)",
+                (key, body, fresh, exp),
             )
             self._db.commit()
 
@@ -117,24 +136,36 @@ class Cache:
             self._db.execute("DELETE FROM cache WHERE expires < ?", (time.time(),))
             self._db.commit()
 
-    async def get(self, key: str):
-        now = time.time()
-        val = self._mem_get(key, now)
-        if val is not _MISS:
-            return val
-        res = await asyncio.to_thread(self._db_get, key, now)
-        if res is _MISS:
-            return _MISS
-        body, exp = res
-        val = json.loads(body)
-        self._mem_put(key, exp, val, len(body))
-        return val
+    async def get_swr(self, key: str):
+        """Return (val, is_stale) for a usable entry, else _MISS.
 
-    async def set(self, key: str, val: object, ttl: int):
+        A stale entry is still returned; the caller decides whether to refresh.
+        """
+        now = time.time()
+        res = self._mem_get(key, now)
+        if res is not _MISS:
+            return res
+        row = await asyncio.to_thread(self._db_get, key, now)
+        if row is _MISS:
+            return _MISS
+        body, fresh, exp = row
+        val = json.loads(body)
+        self._mem_put(key, fresh, exp, val, len(body))
+        return val, fresh <= now
+
+    async def get(self, key: str):
+        """Fresh-only lookup: returns the value, or _MISS if absent/stale/expired."""
+        res = await self.get_swr(key)
+        if res is _MISS or res[1]:  # absent or stale
+            return _MISS
+        return res[0]
+
+    async def set(self, key: str, val: object, ttl: int, stale: int = 0):
         body = json.dumps(val)
-        exp = time.time() + ttl
-        self._mem_put(key, exp, val, len(body))
-        await asyncio.to_thread(self._db_put, key, body, exp)
+        fresh = time.time() + ttl
+        exp = fresh + stale
+        self._mem_put(key, fresh, exp, val, len(body))
+        await asyncio.to_thread(self._db_put, key, body, fresh, exp)
 
     async def purge(self):
         await asyncio.to_thread(self._db_purge)
@@ -149,6 +180,8 @@ cache: Cache
 sem: asyncio.Semaphore
 # In-flight de-duplication: URL -> Future, so concurrent callers share one fetch.
 _inflight: dict[str, asyncio.Future] = {}
+# Strong refs to fire-and-forget revalidation tasks, so they aren't GC'd mid-flight.
+_background_tasks: set[asyncio.Task] = set()
 
 
 @asynccontextmanager
@@ -168,8 +201,11 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         purger.cancel()
+        for t in _background_tasks:
+            t.cancel()
         with suppress(asyncio.CancelledError):
             await purger
+            await asyncio.gather(*_background_tasks, return_exceptions=True)
         await app.state.client.aclose()
         cache.close()
 
@@ -177,23 +213,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-async def get_json(client: httpx.AsyncClient, url: str) -> dict | None:
-    """GET JSON via the shared cache, single-flight, and concurrency cap."""
-    cached = await cache.get(url)
-    if cached is not _MISS:
-        return cached
-    if url in _inflight:
-        return await _inflight[url]
+async def _fetch_json(client: httpx.AsyncClient, url: str, ttl: int, stale: int) -> dict | None:
+    """Fetch `url`, cache it, and resolve its single-flight future.
 
-    fut = asyncio.get_running_loop().create_future()
-    _inflight[url] = fut
+    The caller must have already registered `_inflight[url]`. Successful
+    responses get a fresh `ttl` plus a `stale` window; failures get a brief
+    negative cache with no stale window (no point serving a stale 404).
+    """
+    fut = _inflight[url]
     try:
         try:
             async with sem:  # cap simultaneous PyPI requests
                 r = await client.get(url)
             r.raise_for_status()
             data = r.json()
-            await cache.set(url, data, CACHE_TTL)
+            await cache.set(url, data, ttl, stale)
         except Exception:
             data = None
             await cache.set(url, None, NEG_TTL)  # brief negative cache
@@ -203,14 +237,58 @@ async def get_json(client: httpx.AsyncClient, url: str) -> dict | None:
         _inflight.pop(url, None)
 
 
+def _revalidate(client: httpx.AsyncClient, url: str, ttl: int, stale: int) -> None:
+    """Kick off a background refresh of `url` unless one is already running."""
+    if url in _inflight:
+        return
+    _inflight[url] = asyncio.get_running_loop().create_future()
+    task = asyncio.create_task(_fetch_json(client, url, ttl, stale))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def get_json(
+    client: httpx.AsyncClient, url: str, ttl: int = CACHE_TTL, stale: int = STALE_TTL
+) -> dict | None:
+    """GET JSON via the shared cache, single-flight, and concurrency cap.
+
+    On a stale hit the cached value is returned immediately and a background
+    revalidation is scheduled (stale-while-revalidate). `ttl`/`stale` let
+    immutable endpoints (per-version metadata) live far longer than the
+    mutable package index.
+    """
+    cached = await cache.get_swr(url)
+    if cached is not _MISS:
+        val, is_stale = cached
+        if is_stale:
+            _revalidate(client, url, ttl, stale)
+        return val
+    if url in _inflight:
+        return await _inflight[url]
+
+    _inflight[url] = asyncio.get_running_loop().create_future()
+    return await _fetch_json(client, url, ttl, stale)
+
+
 async def get_index(client: httpx.AsyncClient, name: str) -> dict | None:
-    """All releases of a package (versions + files), for version selection."""
+    """All releases of a package (versions + files), for version selection.
+
+    Mutable — new releases and yanks appear here — so it keeps the short TTL.
+    """
     return await get_json(client, f"https://pypi.org/pypi/{name}/json")
 
 
 async def get_version_meta(client: httpx.AsyncClient, name: str, version: str) -> dict | None:
-    """Metadata for one specific version — carries that version's requires_dist."""
-    return await get_json(client, f"https://pypi.org/pypi/{name}/{version}/json")
+    """Metadata for one specific version — carries that version's requires_dist.
+
+    Immutable once published, so it lives far longer than the package index.
+    """
+    return await get_json(
+        client,
+        f"https://pypi.org/pypi/{name}/{version}/json",
+        ttl=VERSION_TTL,
+        stale=VERSION_STALE_TTL,
+    )
 
 
 def best_version(index: dict, spec: SpecifierSet) -> str | None:
