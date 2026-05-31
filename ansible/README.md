@@ -1,7 +1,7 @@
 # Deploying pysize
 
 Runs pysize as a systemd service (uvicorn on `127.0.0.1:8731`) behind one nginx
-vhost that reverse-proxies to it. Your existing nginx + PHP sites are untouched —
+vhost that reverse-proxies to it. Any existing nginx sites are untouched —
 nginx just gains one server block on a new subdomain.
 
 ## What it sets up
