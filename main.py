@@ -334,6 +334,30 @@ def pick_distribution(release_files: list[dict]) -> dict | None:
     return sdists[0] if sdists else (release_files[0] if release_files else None)
 
 
+def extract_license(info: dict) -> str:
+    """Best short license label for a package version.
+
+    Prefer the SPDX `license_expression` (PEP 639), then license classifiers,
+    then the free-text `license` field — but only if it's short, since that
+    field is frequently stuffed with the entire license *text*.
+    """
+    expr = (info.get("license_expression") or "").strip()
+    if expr:
+        return expr
+    names = [
+        c.rsplit("::", 1)[-1].strip()
+        for c in info.get("classifiers") or []
+        if c.startswith("License ::")
+    ]
+    names = [n for n in names if n and n != "OSI Approved"]
+    if names:
+        return ", ".join(dict.fromkeys(names))  # dedupe, keep order
+    lic = (info.get("license") or "").strip()
+    if lic and len(lic) <= 40 and "\n" not in lic:
+        return lic
+    return ""
+
+
 def marker_allows(req: Requirement, extras: set[str]) -> bool:
     """Is this dependency active given the requested extras?
 
@@ -408,6 +432,10 @@ async def resolve(
                 "name": index["info"]["name"],
                 "version": version,
                 "size": dist.get("size", 0) if dist else 0,
+                # No wheel ⇒ the size is a source tarball, not an install size.
+                "sdist": bool(dist and dist.get("packagetype") == "sdist"),
+                "released": (dist or {}).get("upload_time_iso_8601", ""),
+                "license": "",  # filled from the per-version metadata below
             }
             to_expand.append(canon)
 
@@ -417,7 +445,9 @@ async def resolve(
         for canon, meta in zip(to_expand, metas):
             if meta is None:
                 continue
-            for raw in meta["info"].get("requires_dist") or []:
+            minfo = meta["info"]
+            info[canon]["license"] = extract_license(minfo)
+            for raw in minfo.get("requires_dist") or []:
                 try:
                     req = Requirement(raw)
                 except Exception:
@@ -462,7 +492,14 @@ async def api_size(request: Request, pkg: str):
 
     # Sum each unique package once; build a flat list of dependencies by size.
     deps = [
-        {"name": p["name"], "version": p["version"], "size": p["size"]}
+        {
+            "name": p["name"],
+            "version": p["version"],
+            "size": p["size"],
+            "sdist": p.get("sdist", False),
+            "released": p.get("released", ""),
+            "license": p.get("license", ""),
+        }
         for canon, p in info.items()
         if canon != root
     ]
@@ -473,6 +510,9 @@ async def api_size(request: Request, pkg: str):
         "name": root_pkg["name"],
         "version": root_pkg["version"],
         "self_size": root_pkg["size"],
+        "self_sdist": root_pkg.get("sdist", False),
+        "self_released": root_pkg.get("released", ""),
+        "self_license": root_pkg.get("license", ""),
         "total_size": total,
         "dep_count": len(deps),
         "packages": deps,

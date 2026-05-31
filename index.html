@@ -35,6 +35,8 @@
   .node .nm { overflow:hidden; text-overflow:ellipsis; }
   .node .sz { color:var(--muted); padding-left:12px; }
   .node.circular .nm { color:var(--muted); font-style:italic; }
+  .node .sdist { font-size:11px; color:var(--accent); border:1px solid var(--line);
+                 border-radius:4px; padding:0 5px; margin-left:6px; }
   .bar { height:4px; border-radius:3px; background:var(--accent); opacity:.55; margin:1px 14px 7px; }
   .node { padding-bottom:0; cursor:pointer; border-radius:6px; }
   .node:hover { background:#1d242e; }
@@ -90,6 +92,16 @@ function fmt(bytes){
 function esc(s){ return String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
+function age(iso){
+  const d = new Date(iso);
+  if(isNaN(d)) return '';
+  const days = (Date.now() - d.getTime()) / 86400000;
+  if(days < 1) return 'today';
+  if(days < 60) return Math.round(days)+'d ago';
+  if(days < 730) return Math.round(days/30)+'mo ago';
+  return Math.round(days/365)+'y ago';
+}
+
 async function render(val){
   go.disabled = true;
   out.innerHTML = '<div class="spin">resolving '+esc(val)+' …</div>';
@@ -98,13 +110,20 @@ async function render(val){
     const d = await r.json();
     if(!r.ok){ out.innerHTML = '<div class="err">'+esc(d.error||'error')+'</div>'; return; }
     const max = Math.max(d.self_size, ...d.packages.map(p => p.size), 1);
-    const row = (pkg, name, version, size) =>
-      `<div class="node" data-pkg="${esc(pkg)}">`
-      + `<span class="nm">${esc(name)} <span class="muted">${esc(version||'')}</span></span>`
-      + `<span class="sz">${fmt(size)}</span></div>`
-      + `<div class="bar" style="width:${(size/max*100).toFixed(1)}%"></div>`;
-    const rows = [row(d.name, d.name, d.version, d.self_size)]
-      .concat(d.packages.map(p => row(p.name, p.name, p.version, p.size)));
+    const row = (p) => {
+      const bits = [p.version, p.license, age(p.released)].filter(Boolean).map(esc);
+      const sub = `<span class="muted">${bits.join(' · ')}</span>`;
+      const sdist = p.sdist
+        ? ` <span class="sdist" title="No wheel published — size is the source tarball, not the installed size">sdist</span>`
+        : '';
+      return `<div class="node" data-pkg="${esc(p.name)}">`
+        + `<span class="nm">${esc(p.name)} ${sub}${sdist}</span>`
+        + `<span class="sz">${fmt(p.size)}</span></div>`
+        + `<div class="bar" style="width:${(p.size/max*100).toFixed(1)}%"></div>`;
+    };
+    const rootRow = {name:d.name, version:d.version, size:d.self_size,
+      sdist:d.self_sdist, released:d.self_released, license:d.self_license};
+    const rows = [row(rootRow)].concat(d.packages.map(row));
     out.innerHTML = `
       <div class="stats">
         <div class="stat"><div class="v">${fmt(d.total_size)}</div><div class="l">total size</div></div>
