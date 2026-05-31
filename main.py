@@ -5,11 +5,16 @@
 """Pysize — a bundlephobia-style size explorer for PyPI packages."""
 
 import asyncio
+import json
+import sqlite3
+import threading
 import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
@@ -17,9 +22,13 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-app = FastAPI()
-
-CACHE_TTL = 3600  # seconds to keep a PyPI response
+CACHE_TTL = 3600          # seconds to keep a successful PyPI response
+NEG_TTL = 60              # seconds to keep a failure/404 (negative cache)
+CACHE_PATH = Path(__file__).with_name("pysize-cache.sqlite")
+MAX_CONCURRENCY = 12      # simultaneous outbound requests to PyPI
+MEM_BUDGET = 32 * 1024 * 1024  # bytes of cached JSON text kept in memory
+PURGE_INTERVAL = 600      # seconds between expired-row sweeps
+USER_AGENT = "pysize-poc (+https://github.com/; package-size explorer)"
 
 # Evaluate environment markers against a fixed target Python, not whatever
 # interpreter happens to run the server — otherwise results drift (e.g. a
@@ -31,20 +40,145 @@ _TARGET_ENV = {
     "python_full_version": TARGET_PYTHON + ".0",
 }
 
-# Shared across requests: URL -> (expiry_monotonic, parsed_json_or_None).
-_cache: dict[str, tuple[float, dict | None]] = {}
+_MISS = object()  # distinguishes "absent/expired" from a cached None
+
+
+class Cache:
+    """Two-tier TTL cache: a size-bounded in-memory LRU over a SQLite file.
+
+    Values must be JSON-serializable. A stored value may be None (negative
+    cache); get() returns the _MISS sentinel only when a key is absent or
+    expired. SQLite work runs in a worker thread so it never blocks the loop.
+    Memory is bounded by serialized-text bytes, so a few thousand huge package
+    indexes can be cached on disk without ever holding them all in RAM.
+    """
+
+    def __init__(self, path: Path, mem_budget: int = MEM_BUDGET):
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS cache "
+            "(key TEXT PRIMARY KEY, body TEXT, expires REAL)"
+        )
+        self._db.commit()
+        self._lock = threading.Lock()
+        self._mem: OrderedDict[str, tuple[float, object, int]] = OrderedDict()
+        self._mem_bytes = 0
+        self._mem_budget = mem_budget
+
+    # --- in-memory tier (touched only from the event-loop thread) ---
+    def _mem_get(self, key: str, now: float):
+        hit = self._mem.get(key)
+        if hit is None:
+            return _MISS
+        exp, val, _ = hit
+        if exp <= now:
+            self._mem_drop(key)
+            return _MISS
+        self._mem.move_to_end(key)
+        return val
+
+    def _mem_drop(self, key: str):
+        old = self._mem.pop(key, None)
+        if old:
+            self._mem_bytes -= old[2]
+
+    def _mem_put(self, key: str, exp: float, val: object, nbytes: int):
+        self._mem_drop(key)
+        self._mem[key] = (exp, val, nbytes)
+        self._mem_bytes += nbytes
+        while self._mem_bytes > self._mem_budget and self._mem:
+            k, (_, _, nb) = self._mem.popitem(last=False)
+            self._mem_bytes -= nb
+
+    # --- sqlite tier (run via asyncio.to_thread) ---
+    def _db_get(self, key: str, now: float):
+        with self._lock:
+            row = self._db.execute(
+                "SELECT body, expires FROM cache WHERE key=?", (key,)
+            ).fetchone()
+        if row is None or row[1] <= now:
+            return _MISS
+        return row[0], row[1]
+
+    def _db_put(self, key: str, body: str, exp: float):
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO cache (key, body, expires) VALUES (?,?,?)",
+                (key, body, exp),
+            )
+            self._db.commit()
+
+    def _db_purge(self):
+        with self._lock:
+            self._db.execute("DELETE FROM cache WHERE expires < ?", (time.time(),))
+            self._db.commit()
+
+    async def get(self, key: str):
+        now = time.time()
+        val = self._mem_get(key, now)
+        if val is not _MISS:
+            return val
+        res = await asyncio.to_thread(self._db_get, key, now)
+        if res is _MISS:
+            return _MISS
+        body, exp = res
+        val = json.loads(body)
+        self._mem_put(key, exp, val, len(body))
+        return val
+
+    async def set(self, key: str, val: object, ttl: int):
+        body = json.dumps(val)
+        exp = time.time() + ttl
+        self._mem_put(key, exp, val, len(body))
+        await asyncio.to_thread(self._db_put, key, body, exp)
+
+    async def purge(self):
+        await asyncio.to_thread(self._db_purge)
+
+    def close(self):
+        with self._lock:
+            self._db.close()
+
+
+# Module-level singletons, initialized in the lifespan handler.
+cache: Cache
+sem: asyncio.Semaphore
 # In-flight de-duplication: URL -> Future, so concurrent callers share one fetch.
 _inflight: dict[str, asyncio.Future] = {}
-# Resolved-result cache: requirement key -> (expiry_monotonic, response dict).
-_resolve_cache: dict[str, tuple[float, dict]] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global cache, sem
+    cache = Cache(CACHE_PATH)
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    app.state.client = httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, timeout=20)
+
+    async def purge_loop():
+        while True:
+            await asyncio.sleep(PURGE_INTERVAL)
+            await cache.purge()
+
+    purger = asyncio.create_task(purge_loop())
+    try:
+        yield
+    finally:
+        purger.cancel()
+        with suppress(asyncio.CancelledError):
+            await purger
+        await app.state.client.aclose()
+        cache.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 async def get_json(client: httpx.AsyncClient, url: str) -> dict | None:
-    """GET JSON with a shared TTL cache and single-flight de-duplication."""
-    now = time.monotonic()
-    hit = _cache.get(url)
-    if hit and hit[0] > now:
-        return hit[1]
+    """GET JSON via the shared cache, single-flight, and concurrency cap."""
+    cached = await cache.get(url)
+    if cached is not _MISS:
+        return cached
     if url in _inflight:
         return await _inflight[url]
 
@@ -52,13 +186,14 @@ async def get_json(client: httpx.AsyncClient, url: str) -> dict | None:
     _inflight[url] = fut
     try:
         try:
-            r = await client.get(url, timeout=20)
+            async with sem:  # cap simultaneous PyPI requests
+                r = await client.get(url)
             r.raise_for_status()
             data = r.json()
-            _cache[url] = (now + CACHE_TTL, data)
+            await cache.set(url, data, CACHE_TTL)
         except Exception:
             data = None
-            _cache[url] = (now + 60, None)  # brief negative cache
+            await cache.set(url, None, NEG_TTL)  # brief negative cache
         fut.set_result(data)
         return data
     finally:
@@ -205,7 +340,7 @@ async def resolve(
 
 
 @app.get("/api/size")
-async def api_size(pkg: str):
+async def api_size(request: Request, pkg: str):
     try:
         req = Requirement(pkg.strip())
     except Exception:
@@ -213,14 +348,12 @@ async def api_size(pkg: str):
 
     # Cache the whole resolution, not just the upstream HTTP responses, so a
     # repeated query skips the graph walk entirely.
-    key = f"{canonicalize_name(req.name)}[{','.join(sorted(req.extras))}]{req.specifier}"
-    now = time.monotonic()
-    hit = _resolve_cache.get(key)
-    if hit and hit[0] > now:
-        return hit[1]
+    key = f"resolve:{canonicalize_name(req.name)}[{','.join(sorted(req.extras))}]{req.specifier}"
+    cached = await cache.get(key)
+    if cached not in (_MISS, None):
+        return cached
 
-    async with httpx.AsyncClient(headers={"User-Agent": "pysize-poc"}) as client:
-        info = await resolve(client, req)
+    info = await resolve(request.app.state.client, req)
 
     root = canonicalize_name(req.name)
     root_pkg = info.get(root)
@@ -244,7 +377,7 @@ async def api_size(pkg: str):
         "dep_count": len(deps),
         "packages": deps,
     }
-    _resolve_cache[key] = (now + CACHE_TTL, result)
+    await cache.set(key, result, CACHE_TTL)
     return result
 
 
