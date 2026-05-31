@@ -7,7 +7,7 @@ certbot_email: you@example.com           # for Let's Encrypt expiry notices
 
 # ── Sensible defaults (usually leave as-is) ─────────────────────────────────
 app_user: pysize                         # dedicated system user, no login
-app_root: /opt/pysize                    # code + venv live here
+app_root: /opt/pysize                    # code + venv live here (e.g. "/var/www/{{ domain }}" to match a per-host web layout)
 state_dir: /var/lib/pysize               # writable runtime data (sqlite cache)
 app_host: 127.0.0.1                      # app binds localhost; nginx proxies to it
 app_port: 8731
