@@ -23,9 +23,14 @@ nginx just gains one server block on a new subdomain.
 
 ```bash
 cd ansible
-# edit vars.yml (domain, repo_url, certbot_email) and inventory.ini (host, ssh user)
+cp vars.example.yml vars.yml            # then edit: domain, certbot_email
+cp inventory.example.ini inventory.ini  # then edit: host, ssh user
 ansible-playbook -i inventory.ini playbook.yml
 ```
+
+`vars.yml` and `inventory.ini` are gitignored — this is a public repo, so your
+per-instance values (domain, email, server IP) stay local and are never
+committed. The `*.example.*` files are the tracked templates.
 
 On the first run with no certificate yet, the playbook serves the app over HTTP,
 obtains a cert via certbot, then redeploys the vhost with TLS — all in one run.

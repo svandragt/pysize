@@ -1,2 +1,6 @@
 pysize-cache.sqlite*
 __pycache__/
+
+# Per-instance deploy config (public repo) — copy the .example files and edit.
+ansible/vars.yml
+ansible/inventory.ini
