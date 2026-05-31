@@ -1,0 +1,3 @@
+# {{ ansible_managed }}
+# Per-IP rate limit shared zone for pysize (referenced by the vhost).
+limit_req_zone $binary_remote_addr zone=pysize:10m rate={{ rate_limit }};

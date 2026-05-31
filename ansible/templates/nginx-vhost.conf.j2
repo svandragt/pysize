@@ -1,0 +1,55 @@
+# {{ ansible_managed }} — pysize reverse proxy
+# PHP and other vhosts on this server are unaffected.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ domain }};
+
+    # Always serve the ACME http-01 challenge so certbot can renew.
+    location /.well-known/acme-challenge/ {
+        root {{ acme_webroot }};
+    }
+
+{% if tls_enabled %}
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {{ domain }};
+
+    ssl_certificate     /etc/letsencrypt/live/{{ domain }}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{ domain }}/privkey.pem;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+
+    location / {
+        limit_req zone=pysize burst={{ rate_burst }} nodelay;
+        proxy_pass http://{{ app_host }}:{{ app_port }};
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;   # a cold resolve of a huge package can take a while
+    }
+}
+{% else %}
+    # No certificate yet — proxy over HTTP so the app is reachable while
+    # certbot validates. This block is replaced with the TLS one above
+    # automatically on the same playbook run once the cert is issued.
+    location / {
+        limit_req zone=pysize burst={{ rate_burst }} nodelay;
+        proxy_pass http://{{ app_host }}:{{ app_port }};
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+}
+{% endif %}

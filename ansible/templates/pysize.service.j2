@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+[Unit]
+Description=pysize — PyPI package size explorer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ app_user }}
+Group={{ app_user }}
+WorkingDirectory={{ app_root }}/app
+Environment=PYSIZE_CACHE={{ state_dir }}/cache.sqlite
+ExecStart={{ app_root }}/venv/bin/uvicorn main:app --host {{ app_host }} --port {{ app_port }}
+Restart=always
+RestartSec=2
+
+# Hardening — the app only needs to write to the state dir.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ state_dir }}
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

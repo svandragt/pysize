@@ -1,0 +1,170 @@
+---
+- name: Deploy pysize behind nginx (reverse proxy, systemd service)
+  hosts: pysize
+  become: true
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Install base packages (nginx/php already present, untouched)
+      ansible.builtin.apt:
+        name:
+          - git
+          - curl
+          - certbot
+          - acl          # lets become_user run file ops cleanly
+        state: present
+        update_cache: true
+
+    - name: Install uv to /usr/local/bin
+      ansible.builtin.shell:
+        cmd: >
+          curl -LsSf https://astral.sh/uv/install.sh
+          | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+      args:
+        creates: /usr/local/bin/uv
+
+    - name: Create dedicated service user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        home: "{{ app_root }}"
+        shell: /usr/sbin/nologin
+        create_home: true
+
+    - name: Create writable state directory (sqlite cache lives here)
+      ansible.builtin.file:
+        path: "{{ state_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+
+    - name: Clone/update the repository
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_root }}/app"
+        version: "{{ repo_version }}"
+      become_user: "{{ app_user }}"
+      notify: restart pysize
+
+    - name: Create the virtualenv with uv
+      ansible.builtin.command:
+        cmd: "uv venv --python {{ python_version }} {{ app_root }}/venv"
+        creates: "{{ app_root }}/venv"
+      become_user: "{{ app_user }}"
+      environment:
+        UV_CACHE_DIR: "{{ app_root }}/.uv-cache"
+
+    - name: Install Python dependencies into the venv
+      ansible.builtin.command:
+        cmd: >
+          uv pip install --python {{ app_root }}/venv
+          fastapi 'uvicorn[standard]' httpx packaging
+      become_user: "{{ app_user }}"
+      environment:
+        UV_CACHE_DIR: "{{ app_root }}/.uv-cache"
+      register: pip_install
+      changed_when: "'Installed' in pip_install.stdout or 'Prepared' in pip_install.stdout"
+      notify: restart pysize
+
+    - name: Install systemd unit
+      ansible.builtin.template:
+        src: templates/pysize.service.j2
+        dest: /etc/systemd/system/pysize.service
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart pysize
+
+    - name: Enable and start pysize
+      ansible.builtin.systemd:
+        name: pysize
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Ensure ACME webroot exists
+      ansible.builtin.file:
+        path: "{{ acme_webroot }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: Install nginx rate-limit zone (http context)
+      ansible.builtin.template:
+        src: templates/ratelimit.conf.j2
+        dest: /etc/nginx/conf.d/pysize-ratelimit.conf
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Check whether a TLS certificate already exists
+      ansible.builtin.stat:
+        path: "/etc/letsencrypt/live/{{ domain }}/fullchain.pem"
+      register: cert
+
+    # First deploy the vhost matching the current cert state. If no cert yet,
+    # this serves the app over plain HTTP and exposes the ACME challenge path,
+    # so certbot can validate. Once the cert exists it's redeployed with TLS.
+    - name: Deploy nginx vhost
+      ansible.builtin.template:
+        src: templates/nginx-vhost.conf.j2
+        dest: /etc/nginx/sites-available/pysize.conf
+        mode: "0644"
+      vars:
+        tls_enabled: "{{ cert.stat.exists }}"
+
+    - name: Enable the vhost
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/pysize.conf
+        dest: /etc/nginx/sites-enabled/pysize.conf
+        state: link
+
+    - name: Validate nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Reload nginx so the ACME challenge is served (pre-cert only)
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+      when: not cert.stat.exists
+
+    - name: Obtain certificate via certbot (webroot)
+      ansible.builtin.command:
+        cmd: >
+          certbot certonly --webroot -w {{ acme_webroot }}
+          -d {{ domain }} --email {{ certbot_email }}
+          --agree-tos --non-interactive
+        creates: "/etc/letsencrypt/live/{{ domain }}/fullchain.pem"
+      when: not cert.stat.exists
+
+    - name: Re-check certificate
+      ansible.builtin.stat:
+        path: "/etc/letsencrypt/live/{{ domain }}/fullchain.pem"
+      register: cert_after
+
+    - name: Redeploy nginx vhost with TLS enabled
+      ansible.builtin.template:
+        src: templates/nginx-vhost.conf.j2
+        dest: /etc/nginx/sites-available/pysize.conf
+        mode: "0644"
+      vars:
+        tls_enabled: "{{ cert_after.stat.exists }}"
+      notify: reload nginx
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart pysize
+      ansible.builtin.systemd:
+        name: pysize
+        state: restarted
+
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

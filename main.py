@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -24,7 +25,7 @@ from packaging.version import InvalidVersion, Version
 
 CACHE_TTL = 3600          # seconds to keep a successful PyPI response
 NEG_TTL = 60              # seconds to keep a failure/404 (negative cache)
-CACHE_PATH = Path(__file__).with_name("pysize-cache.sqlite")
+CACHE_PATH = Path(os.environ.get("PYSIZE_CACHE") or Path(__file__).with_name("pysize-cache.sqlite"))
 MAX_CONCURRENCY = 12      # simultaneous outbound requests to PyPI
 MEM_BUDGET = 32 * 1024 * 1024  # bytes of cached JSON text kept in memory
 PURGE_INTERVAL = 600      # seconds between expired-row sweeps
