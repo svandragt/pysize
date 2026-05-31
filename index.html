@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pysize — find the cost of PyPI packages</title>
+<style>
+  :root { --bg:#0e1116; --card:#161b22; --line:#2a313c; --fg:#e6edf3; --muted:#8b949e; --accent:#ffb454; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--fg); }
+  .wrap { max-width:760px; margin:0 auto; padding:48px 20px 80px; }
+  h1 { font-size:30px; margin:0 0 4px; }
+  h1 .py { color:var(--accent); }
+  p.sub { color:var(--muted); margin:0 0 28px; }
+  form { display:flex; gap:8px; }
+  input { flex:1; padding:13px 15px; font-size:16px; background:var(--card);
+          border:1px solid var(--line); border-radius:8px; color:var(--fg); }
+  input:focus { outline:none; border-color:var(--accent); }
+  button { padding:13px 20px; font-size:16px; font-weight:600; border:0; border-radius:8px;
+           background:var(--accent); color:#1a1206; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .examples { margin:14px 0 0; color:var(--muted); font-size:14px; }
+  .examples a { color:var(--accent); cursor:pointer; margin-right:12px; }
+  .stats { display:flex; gap:14px; margin:32px 0 8px; }
+  .stat { flex:1; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; }
+  .stat .v { font-size:26px; font-weight:700; }
+  .stat .l { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.04em; }
+  .title { margin:28px 0 6px; font-size:18px; }
+  .muted { color:var(--muted); }
+  .tree { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:8px 4px; font:14px ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .node { display:flex; justify-content:space-between; padding:3px 14px; white-space:nowrap; }
+  .node .nm { overflow:hidden; text-overflow:ellipsis; }
+  .node .sz { color:var(--muted); padding-left:12px; }
+  .node.circular .nm { color:var(--muted); font-style:italic; }
+  .bar { height:4px; border-radius:3px; background:var(--accent); opacity:.55; margin:1px 14px 7px; }
+  .node { padding-bottom:0; }
+  .err { color:#ff7b72; margin-top:24px; }
+  .spin { color:var(--muted); margin-top:24px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>py<span class="py">size</span></h1>
+  <p class="sub">find the install size of a PyPI package — wheel + all dependencies.</p>
+  <form id="f">
+    <input id="q" placeholder="e.g. requests  or  headroom-ai[all]" autocomplete="off" autofocus>
+    <button id="go">Go</button>
+  </form>
+  <p class="examples">try:
+    <a data-q="requests">requests</a>
+    <a data-q="fastapi">fastapi</a>
+    <a data-q="pandas">pandas</a>
+    <a data-q="headroom-ai[all]">headroom-ai[all]</a>
+  </p>
+  <div id="out"></div>
+</div>
+<script>
+const out = document.getElementById('out');
+const q = document.getElementById('q');
+const go = document.getElementById('go');
+
+function fmt(bytes){
+  if(bytes >= 1048576) return (bytes/1048576).toFixed(2)+' MB';
+  if(bytes >= 1024) return (bytes/1024).toFixed(1)+' kB';
+  return bytes+' B';
+}
+
+async function search(){
+  const val = q.value.trim();
+  if(!val) return;
+  go.disabled = true;
+  out.innerHTML = '<div class="spin">resolving '+val+' …</div>';
+  try {
+    const r = await fetch('/api/size?pkg='+encodeURIComponent(val));
+    const d = await r.json();
+    if(!r.ok){ out.innerHTML = '<div class="err">'+(d.error||'error')+'</div>'; return; }
+    const max = Math.max(d.self_size, ...d.packages.map(p => p.size), 1);
+    const row = (name, version, size) =>
+      `<div class="node"><span class="nm">${name} <span class="muted">${version||''}</span></span>`
+      + `<span class="sz">${fmt(size)}</span></div>`
+      + `<div class="bar" style="width:${(size/max*100).toFixed(1)}%"></div>`;
+    const rows = [row(d.name, d.version, d.self_size)]
+      .concat(d.packages.map(p => row(p.name, p.version, p.size)));
+    out.innerHTML = `
+      <div class="stats">
+        <div class="stat"><div class="v">${fmt(d.total_size)}</div><div class="l">total size</div></div>
+        <div class="stat"><div class="v">${fmt(d.self_size)}</div><div class="l">package only</div></div>
+        <div class="stat"><div class="v">${d.dep_count}</div><div class="l">dependencies</div></div>
+      </div>
+      <div class="title">${d.name} ${d.version} <span class="muted">— ${d.dep_count} unique deps, largest first</span></div>
+      <div class="tree">${rows.join('')}</div>`;
+  } catch(e){
+    out.innerHTML = '<div class="err">request failed: '+e+'</div>';
+  } finally {
+    go.disabled = false;
+  }
+}
+
+document.getElementById('f').addEventListener('submit', e => { e.preventDefault(); search(); });
+document.querySelectorAll('.examples a').forEach(a =>
+  a.addEventListener('click', () => { q.value = a.dataset.q; search(); }));
+</script>
+</body>
+</html>
