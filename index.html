@@ -29,6 +29,12 @@
   .stat .l { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.04em; }
   .title { margin:28px 0 6px; font-size:18px; }
   .muted { color:var(--muted); }
+  .pkginfo { background:var(--card); border:1px solid var(--line); border-radius:10px;
+             padding:16px 18px; margin-top:8px; }
+  .pkginfo .top { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+  .pkginfo .nm { font-size:18px; font-weight:600; }
+  .pkginfo .sz { color:var(--muted); white-space:nowrap; }
+  .pkginfo .meta { font-size:13px; margin-top:5px; }
   .tree { background:var(--card); border:1px solid var(--line); border-radius:10px;
           padding:8px 4px; font:14px ui-monospace,SFMono-Regular,Menlo,monospace; }
   .node { display:flex; justify-content:space-between; padding:3px 14px; white-space:nowrap; }
@@ -109,29 +115,40 @@ async function render(val){
     const r = await fetch('/api/size?pkg='+encodeURIComponent(val));
     const d = await r.json();
     if(!r.ok){ out.innerHTML = '<div class="err">'+esc(d.error||'error')+'</div>'; return; }
-    const max = Math.max(d.self_size, ...d.packages.map(p => p.size), 1);
+    const sdistBadge = (on) => on
+      ? ` <span class="sdist" title="No wheel published — size is the source tarball, not the installed size">sdist</span>`
+      : '';
+    // Bars scale across the dependencies (the selected package is shown above,
+    // not in the list), so the list reads as a comparison between deps.
+    const max = Math.max(...d.packages.map(p => p.size), 1);
     const row = (p) => {
       const bits = [p.version, p.license, age(p.released)].filter(Boolean).map(esc);
       const sub = `<span class="muted">${bits.join(' · ')}</span>`;
-      const sdist = p.sdist
-        ? ` <span class="sdist" title="No wheel published — size is the source tarball, not the installed size">sdist</span>`
-        : '';
       return `<div class="node" data-pkg="${esc(p.name)}">`
-        + `<span class="nm">${esc(p.name)} ${sub}${sdist}</span>`
+        + `<span class="nm">${esc(p.name)} ${sub}${sdistBadge(p.sdist)}</span>`
         + `<span class="sz">${fmt(p.size)}</span></div>`
         + `<div class="bar" style="width:${(p.size/max*100).toFixed(1)}%"></div>`;
     };
-    const rootRow = {name:d.name, version:d.version, size:d.self_size,
-      sdist:d.self_sdist, released:d.self_released, license:d.self_license};
-    const rows = [row(rootRow)].concat(d.packages.map(row));
+    const selfMeta = [d.self_license, age(d.self_released)].filter(Boolean).map(esc).join(' · ');
+    const depHead = d.dep_count
+      ? `<div class="title">${d.dep_count} unique ${d.dep_count === 1 ? 'dependency' : 'dependencies'} `
+        + `<span class="muted">— click any to drill in</span></div>`
+        + `<div class="tree">${d.packages.map(row).join('')}</div>`
+      : `<div class="title muted">no dependencies</div>`;
     out.innerHTML = `
       <div class="stats">
         <div class="stat"><div class="v">${fmt(d.total_size)}</div><div class="l">total size</div></div>
         <div class="stat"><div class="v">${fmt(d.self_size)}</div><div class="l">package only</div></div>
         <div class="stat"><div class="v">${d.dep_count}</div><div class="l">dependencies</div></div>
       </div>
-      <div class="title">${esc(d.name)} ${esc(d.version)} <span class="muted">— ${d.dep_count} unique deps, click any to drill in</span></div>
-      <div class="tree">${rows.join('')}</div>`;
+      <div class="pkginfo">
+        <div class="top">
+          <span class="nm">${esc(d.name)} <span class="muted">${esc(d.version)}</span>${sdistBadge(d.self_sdist)}</span>
+          <span class="sz">${fmt(d.self_size)}</span>
+        </div>
+        ${selfMeta ? `<div class="meta muted">${selfMeta}</div>` : ''}
+      </div>
+      ${depHead}`;
   } catch(e){
     out.innerHTML = '<div class="err">request failed: '+esc(e)+'</div>';
   } finally {
